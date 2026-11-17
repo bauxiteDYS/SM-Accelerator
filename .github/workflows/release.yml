@@ -1,8 +1,6 @@
 name: Release
 on:
   workflow_dispatch:
-  push:
-    branches: [master, release_ci]
 permissions:
   contents: read
 jobs:
