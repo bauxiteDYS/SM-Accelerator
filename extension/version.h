@@ -8,7 +8,7 @@
  */
 
 #if defined SM_GENERATED_BUILD
-#include "version_auto.h"
+#include <accelerator_build.h>
 #else
 
 #ifndef SM_GENERATED_BUILD

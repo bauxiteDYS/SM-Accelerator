@@ -1,0 +1,10 @@
+# vim: set ts=2 sw=2 tw=99 noet ft=python:
+builder.SetBuildFolder('symbols')
+root = builder.AddFolder('.')
+builder.AddCopy(Accelerator.build_info, root)
+if builder.options.debug == '1':
+  for task in Accelerator.extension:
+    folder = builder.AddFolder(task.target.arch)
+    builder.AddCopy(task.binary, folder)
+    if task.debug is not None and task.debug != task.binary:
+      builder.AddCopy(task.debug, folder)

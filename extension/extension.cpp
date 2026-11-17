@@ -18,6 +18,12 @@
  */
 
 #include "extension.h"
+#include "AcceleratorConfig.h"
+#include "CrashUtils.h"
+#include "DumpUploadQueue.h"
+#include "UploadPassControl.h"
+#include "WindowsExceptionPolicy.h"
+#include <exception>
 
 #ifndef PLATFORM_ARCH_FOLDER
 #define PLATFORM_ARCH_FOLDER ""
@@ -25,11 +31,10 @@
 
 #include <sp_vm_api.h>
 
-#if SMINTERFACE_EXTENSIONAPI_VERSION >= 9
-#include <base-runtime.h>
-#endif
+#include "SourcePawnCompat.h"
 
 #include <IWebternet.h>
+#include <IGameHelpers.h>
 #include "MemoryDownloader.h"
 #include "forwards.h"
 #include "natives.h"
@@ -121,6 +126,24 @@ SMEXT_LINK(&g_accelerator);
 IWebternet *webternet;
 IGameConfig *gameconfig;
 
+static AcceleratorConfig acceleratorConfig;
+static IGameHelpers *optionalGameHelpers = nullptr;
+
+static bool AcquireGameHelpers()
+{
+	if (optionalGameHelpers) {
+		return true;
+	}
+	SMInterface *iface = nullptr;
+	if (!sharesys->RequestInterface(SMINTERFACE_GAMEHELPERS_NAME,
+		SMINTERFACE_GAMEHELPERS_VERSION, myself, &iface) || !iface) {
+		return false;
+	}
+	// Only use the SDK's declared interface, never reinterpret an older layout.
+	optionalGameHelpers = static_cast<IGameHelpers *>(iface);
+	return true;
+}
+
 typedef void (*GetSpew_t)(char *buffer, size_t length);
 GetSpew_t GetSpew;
 #if defined _WINDOWS
@@ -144,6 +167,8 @@ char logPath[512];
 google_breakpad::ExceptionHandler *handler = NULL;
 
 #if defined _LINUX
+std::terminate_handler previousTerminateHandler = nullptr;
+
 void terminateHandler()
 {
 	const char *msg = "missing exception";
@@ -190,10 +215,11 @@ static bool dumpCallback(const google_breakpad::MinidumpDescriptor& descriptor, 
 		return succeeded;
 	}
 
-	my_strlcpy(dumpStoragePath, descriptor.path(), sizeof(dumpStoragePath));
-	my_strlcat(dumpStoragePath, ".txt", sizeof(dumpStoragePath));
+	char metadataPath[sizeof(dumpStoragePath) + 4];
+	my_strlcpy(metadataPath, descriptor.path(), sizeof(metadataPath));
+	my_strlcat(metadataPath, ".txt", sizeof(metadataPath));
 
-	int extra = sys_open(dumpStoragePath, O_WRONLY | O_CREAT, S_IRUSR | S_IWUSR);
+	int extra = sys_open(metadataPath, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
 	if (extra == -1) {
 		sys_write(STDOUT_FILENO, "Failed to open metadata file!\n", 30);
 		return succeeded;
@@ -236,10 +262,8 @@ static bool dumpCallback(const google_breakpad::MinidumpDescriptor& descriptor, 
 	return succeeded;
 }
 
-void OnGameFrame(bool simulating)
+void EnsureSignalHandlers()
 {
-	std::set_terminate(terminateHandler);
-
 	bool weHaveBeenFuckedOver = false;
 	struct sigaction oact;
 
@@ -274,41 +298,35 @@ void OnGameFrame(bool simulating)
 
 #elif defined _WINDOWS
 void *vectoredHandler = NULL;
+static bool windowsFirstChance = true;
+static WindowsCaptureGate windowsCaptureGate;
+static std::atomic<DWORD> vectoredRequestThread{0};
 
 LONG CALLBACK BreakpadVectoredHandler(_In_ PEXCEPTION_POINTERS ExceptionInfo)
 {
-	switch (ExceptionInfo->ExceptionRecord->ExceptionCode)
-	{
-		case EXCEPTION_ACCESS_VIOLATION:
-		case EXCEPTION_INVALID_HANDLE:
-		case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
-		case EXCEPTION_DATATYPE_MISALIGNMENT:
-		case EXCEPTION_ILLEGAL_INSTRUCTION:
-		case EXCEPTION_INT_DIVIDE_BY_ZERO:
-		case EXCEPTION_STACK_OVERFLOW:
-		case 0xC0000409: // STATUS_STACK_BUFFER_OVERRUN
-		case 0xC0000374: // STATUS_HEAP_CORRUPTION
-			break;
-		case 0: // Valve use this for Sys_Error.
-			if ((ExceptionInfo->ExceptionRecord->ExceptionFlags & EXCEPTION_NONCONTINUABLE) == 0)
-				return EXCEPTION_CONTINUE_SEARCH;
-			break;
-		default:
-			return EXCEPTION_CONTINUE_SEARCH;
-	}
-
-	if (handler->WriteMinidumpForException(ExceptionInfo))
-	{
-		// Stop the handler thread from deadlocking us.
-		delete handler;
-
-		// Stop Valve's handler being called.
-		ExceptionInfo->ExceptionRecord->ExceptionCode = EXCEPTION_BREAKPOINT;
-
-		return EXCEPTION_EXECUTE_HANDLER;
-	} else {
+	if (!ExceptionInfo || !ExceptionInfo->ExceptionRecord
+		|| !ShouldCaptureWindowsException(ExceptionInfo->ExceptionRecord->ExceptionCode,
+			ExceptionInfo->ExceptionRecord->ExceptionFlags, windowsFirstChance)
+		|| !windowsCaptureGate.TryBegin()) {
 		return EXCEPTION_CONTINUE_SEARCH;
 	}
+	// Capture selected faults before Valve can consume them or terminate.
+	// The gate skips recursive/concurrent capture and lets unload wait for us.
+	if (handler) {
+		vectoredRequestThread.store(GetCurrentThreadId());
+		const char message[] = "Accelerator: Windows exception intercepted; requesting minidump.\n";
+		DWORD written;
+		WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), message, sizeof(message) - 1, &written, nullptr);
+		if (!handler->WriteMinidumpForException(ExceptionInfo)) {
+			const char failure[] = "Accelerator: Breakpad did not complete dump writing.\n";
+			WriteFile(GetStdHandle(STD_OUTPUT_HANDLE), failure, sizeof(failure) - 1, &written, nullptr);
+		}
+		vectoredRequestThread.store(0);
+	}
+	windowsCaptureGate.Finish();
+	// Never delete a live handler or modify an application's exception record.
+	// Leave the application's SEH/engine exception handling semantics intact.
+	return EXCEPTION_CONTINUE_SEARCH;
 }
 
 static bool dumpCallback(const wchar_t* dump_path,
@@ -325,9 +343,13 @@ static bool dumpCallback(const wchar_t* dump_path,
 
 	printf("Wrote minidump to: %ls\\%ls.dmp\n", dump_path, minidump_id);
 
-	sprintf(dumpStoragePath, "%ls\\%ls.dmp.txt", dump_path, minidump_id);
-
-	FILE *extra = fopen(dumpStoragePath, "wb");
+	wchar_t metadataPath[1024];
+	int length = _snwprintf_s(metadataPath, _countof(metadataPath), _TRUNCATE,
+		L"%ls\\%ls.dmp.txt", dump_path, minidump_id);
+	if (length < 0) {
+		return succeeded;
+	}
+	FILE *extra = _wfopen(metadataPath, L"wb");
 	if (!extra) {
 		printf("Failed to open metadata file!\n");
 		return succeeded;
@@ -344,6 +366,10 @@ static bool dumpCallback(const wchar_t* dump_path,
 	}
 	fprintf(extra, "\nExtensionVersion=%s", SM_VERSION);
 	fprintf(extra, "\nExtensionBuild=%s", SM_BUILD_UNIQUEID);
+	const DWORD vectoredThread = vectoredRequestThread.load();
+	const bool firstChance = handler && vectoredThread != 0
+		&& vectoredThread == handler->get_requesting_thread_id();
+	fprintf(extra, "\nFirstChanceCapture=%s", firstChance ? "yes" : "no");
 	fprintf(extra, "%s", steamInf);
 	fprintf(extra, "\n-------- CONFIG END --------\n");
 
@@ -368,6 +394,16 @@ static bool dumpCallback(const wchar_t* dump_path,
 #error Bad platform.
 #endif
 
+void OnGameFrame(bool simulating)
+{
+	// Only the main thread may execute SourcePawn forwards. Polling avoids
+	// queued callbacks into extension code after an unload.
+	g_accelerator.NotifyIfDoneUploading();
+#if defined _LINUX
+	EnsureSignalHandlers();
+#endif
+}
+
 class ClogInhibitor
 {
 	std::streambuf *saved_clog = nullptr;
@@ -385,20 +421,39 @@ public:
 
 class UploadThread: public IThread
 {
+public:
+	void Reset() { control.Reset(); }
+	void RequestStop() { control.RequestStop(); }
+
+private:
+	UploadPassControl control;
 	FILE *log = nullptr;
 	char serverId[38] = "";
 
+	void RemoveDump(const std::string &path, const std::string &metapath, const std::string &processedPath) {
+		if (!metapath.empty()) {
+			unlink(metapath.c_str());
+		}
+		// Keep the marker if removing the dump fails, to prevent re-uploading it.
+		if (unlink(path.c_str()) == 0) {
+			unlink(processedPath.c_str());
+		}
+	}
+
 	void RunThread(IThreadHandle *pHandle) {
 		rootconsole->ConsolePrint("Accelerator upload thread started.");
+
+		const bool keepDumps = acceleratorConfig.GetBool("MinidumpKeepDumps", true);
+		const char *uploadLimit = acceleratorConfig.GetValue("MinidumpUploadLimit");
+		DumpUploadQueue queue(uploadLimit ? static_cast<size_t>(atoi(uploadLimit)) : 2);
 
 		log = fopen(logPath, "a");
 		if (!log) {
 			g_pSM->LogError(myself, "Failed to open Accelerator log file: %s", logPath);
 		}
 
-		char path[512];
-		g_pSM->Format(path, sizeof(path), "%s/server-id.txt", dumpStoragePath);
-		FILE *serverIdFile = fopen(path, "r");
+		const std::string serverIdPath = std::string(dumpStoragePath) + "/server-id.txt";
+		FILE *serverIdFile = fopen(serverIdPath.c_str(), "r");
 		if (serverIdFile) {
 			fread(serverId, 1, sizeof(serverId) - 1, serverIdFile);
 			if (!feof(serverIdFile) || strlen(serverId) != 36) {
@@ -407,7 +462,7 @@ class UploadThread: public IThread
 			fclose(serverIdFile);
 		}
 		if (!serverId[0]) {
-			serverIdFile = fopen(path, "w");
+			serverIdFile = fopen(serverIdPath.c_str(), "w");
 			if (serverIdFile) {
 				g_pSM->Format(serverId, sizeof(serverId), "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
 					rand() % 255, rand() % 255, rand() % 255, rand() % 255, rand() % 255, rand() % 255, 0x40 | ((rand() % 255) & 0x0F), rand() % 255,
@@ -418,15 +473,25 @@ class UploadThread: public IThread
 		}
 
 		IDirectory *dumps = libsys->OpenDirectory(dumpStoragePath);
+		if (!dumps) {
+			g_pSM->LogError(myself, "Failed to open Accelerator dump directory: %s", dumpStoragePath);
+			if (log) {
+				fclose(log);
+				log = nullptr;
+			}
+			g_accelerator.MarkAsDoneUploading();
+			return;
+		}
 
 		int skip = 0;
 		int count = 0;
 		int failed = 0;
-		char metapath[512];
+		size_t pending = 0;
+		size_t attempted = 0;
 		char presubmitToken[512];
 		char response[512];
 
-		while (dumps->MoreFiles()) {
+		while (!control.ShouldStop() && dumps->MoreFiles()) {
 			if (!dumps->IsEntryFile()) {
 				dumps->NextEntry();
 				continue;
@@ -440,21 +505,70 @@ class UploadThread: public IThread
 				continue;
 			}
 
-			g_pSM->Format(path, sizeof(path), "%s/%s", dumpStoragePath, name);
-			g_pSM->Format(metapath, sizeof(metapath), "%s.txt", path);
+			const std::string path = std::string(dumpStoragePath) + "/" + name;
+			const std::string metapath = path + ".txt";
+			const std::string processedPath = path + ".processed";
 
-			if (!libsys->PathExists(metapath)) {
-				metapath[0] = '\0';
+			// Markers survive restarts and also cover metadata-only uploads and
+			// dumps that the crash service explicitly asked us not to upload.
+			if (libsys->PathExists(processedPath.c_str())) {
+				skip++;
+				if (!keepDumps) {
+					RemoveDump(path, metapath, processedPath);
+				}
+				dumps->NextEntry();
+				continue;
 			}
 
+			++pending;
+			time_t modified;
+			if (libsys->FileTime(path.c_str(), FileTime_LastChange, &modified)) {
+				queue.Consider(path, modified);
+			} else {
+				g_pSM->LogError(myself, "Cannot read dump modification time; leaving it on disk: %s", path.c_str());
+			}
+			dumps->NextEntry();
+		}
+		libsys->CloseDirectory(dumps);
+
+		size_t deferred = pending - queue.Entries().size();
+		size_t visited = 0;
+		rootconsole->ConsolePrint("Accelerator selected %zu unprocessed dumps; %zu deferred.", queue.Entries().size(), deferred);
+		if (log) fprintf(log, "Selected %zu unprocessed dumps; %zu deferred (limit or unreadable timestamp)\n", queue.Entries().size(), deferred);
+
+		// Only this fixed selection is attempted. Failures and server-requested
+		// skips consume a slot; never backfill from older dumps in the same run.
+		for (const DumpCandidate &candidate : queue.Entries()) {
+			if (control.ShouldStop()) {
+				break;
+			}
+			++visited;
+			const std::string &path = candidate.path;
+			std::string metapath = path + ".txt";
+			const std::string processedPath = path + ".processed";
+			// Recheck in case files changed since the directory scan.
+			if (libsys->PathExists(processedPath.c_str())) {
+				++skip;
+				if (!keepDumps) {
+					RemoveDump(path, metapath, processedPath);
+				}
+				continue;
+			}
+			if (!libsys->IsPathFile(path.c_str())) {
+				continue;
+			}
+			if (!libsys->PathExists(metapath.c_str())) {
+				metapath.clear();
+			}
+			++attempted;
 			presubmitToken[0] = '\0';
 			PresubmitResponse presubmitResponse = kPRUploadCrashDumpAndMetadata;
+			bool processed = false;
 
-			const char *presubmitOption = g_pSM->GetCoreConfigValue("MinidumpPresubmit");
-			bool canPresubmit = !presubmitOption || (tolower(presubmitOption[0]) == 'y' || presubmitOption[0] == '1');
+			bool canPresubmit = acceleratorConfig.GetBool("MinidumpPresubmit", true);
 
 			if (canPresubmit) {
-				presubmitResponse = PresubmitCrashDump(path, presubmitToken, sizeof(presubmitToken));
+				presubmitResponse = PresubmitCrashDump(path.c_str(), presubmitToken, sizeof(presubmitToken));
 			}
 
 			switch (presubmitResponse) {
@@ -464,9 +578,20 @@ class UploadThread: public IThread
 					if (log) fprintf(log, "Failed to locally process crash dump");
 					break;
 				case kPRRemoteError:
+					// Do not turn a failed presubmit into a larger upload.
+					control.RecordFailure();
+					failed++;
+					g_pSM->LogError(myself, "Accelerator presubmit failed; stopping upload pass and keeping incomplete dumps.");
+					break;
+				case kPRStopped:
+					if (control.HasFailed()) {
+						failed++;
+					}
+					break;
 				case kPRUploadCrashDumpAndMetadata:
 				case kPRUploadMetadataOnly:
-					if (UploadCrashDump((presubmitResponse == kPRUploadMetadataOnly) ? nullptr : path, metapath, presubmitToken, response, sizeof(response))) {
+					if (UploadCrashDump((presubmitResponse == kPRUploadMetadataOnly) ? nullptr : path.c_str(), metapath.c_str(), presubmitToken, response, sizeof(response))) {
+						processed = true;
 						count++;
 						g_pSM->LogError(myself, "Accelerator uploaded crash dump: %s", response);
 						if (log) fprintf(log, "Uploaded crash dump: %s\n", response);
@@ -479,24 +604,44 @@ class UploadThread: public IThread
 					}
 					break;
 				case kPRDontUpload:
+					processed = true;
 					skip++;
 					g_pSM->LogError(myself, "Accelerator crash dump upload skipped by server");
 					if (log) fprintf(log, "Skipped due to server request\n");
 					break;
 			}
 
-			if (metapath[0]) {
-				unlink(metapath);
+			// Retain incomplete work even with keep=no. A successful final
+			// submission that returned during unload must still get its marker.
+			if (!processed && control.ShouldStop()) {
+				break;
 			}
 
-			unlink(path);
+			if (processed) {
+				// An empty sidecar is sufficient: only its existence matters.
+				// Write it even when retention is off, in case deleting the dump fails.
+				FILE *marker = fopen(processedPath.c_str(), "wb");
+				if (marker) {
+					fclose(marker);
+				} else {
+					g_pSM->LogError(myself, "Failed to mark processed crash dump %s; it may be submitted again on restart", path.c_str());
+					if (log) fprintf(log, "Failed to create marker %s; dump may be submitted again on restart\n", processedPath.c_str());
+				}
+			}
+
+			if (!keepDumps) {
+				RemoveDump(path, metapath, processedPath);
+			}
 
 			if (log) fflush(log);
-
-			dumps->NextEntry();
 		}
 
-		libsys->CloseDirectory(dumps);
+		deferred += queue.Entries().size() - visited;
+		if (control.ShouldStop()) {
+			const char *reason = control.HasFailed() ? "a request/protocol failure" : "extension unload";
+			rootconsole->ConsolePrint("Accelerator upload pass stopped after %s; incomplete dumps remain on disk.", reason);
+			if (log) fprintf(log, "Upload pass stopped after %s; incomplete dumps remain on disk. A scan stopped early may not have counted every dump.\n", reason);
+		}
 
 		if (log) {
 			fclose(log);
@@ -504,7 +649,7 @@ class UploadThread: public IThread
 		}
 
 		g_accelerator.MarkAsDoneUploading();
-		rootconsole->ConsolePrint("Accelerator upload thread finished. (%d skipped, %d uploaded, %d failed)", skip, count, failed);
+		rootconsole->ConsolePrint("Accelerator upload thread finished. (%zu attempted, %d skipped, %d uploaded, %d failed, %zu deferred)", attempted, skip, count, failed, deferred);
 	}
 
 	void OnTerminate(IThreadHandle *pHandle, bool cancel) {
@@ -513,6 +658,9 @@ class UploadThread: public IThread
 
 #if defined _LINUX
 	bool UploadSymbolFile(const google_breakpad::CodeModule *module, const char *presubmitToken) {
+		if (control.ShouldStop()) {
+			return false;
+		}
 		if (log) fprintf(log, "UploadSymbolFile\n");
 		if (log) fflush(log);
 
@@ -600,9 +748,12 @@ class UploadThread: public IThread
 			unlink(vdsoOutputPath.c_str());
 		}
 
-		IWebForm *form = webternet->CreateForm();
+		std::unique_ptr<IWebForm> form(webternet->CreateForm());
+		if (!form) {
+			return false;
+		}
 
-		const char *minidumpAccount = g_pSM->GetCoreConfigValue("MinidumpAccount");
+		const char *minidumpAccount = acceleratorConfig.GetValue("MinidumpAccount");
 		if (minidumpAccount && minidumpAccount[0]) form->AddString("UserID", minidumpAccount);
 
 		form->AddString("ExtensionVersion", SMEXT_CONF_VERSION);
@@ -615,41 +766,46 @@ class UploadThread: public IThread
 		form->AddString("symbol_file", output.c_str());
 
 		MemoryDownloader data;
-		IWebTransfer *xfer = webternet->CreateSession();
+		std::unique_ptr<IWebTransfer> xfer(webternet->CreateSession());
+		if (!xfer) {
+			return false;
+		}
 		xfer->SetFailOnHTTPError(true);
 
-		const char *symbolUrl = g_pSM->GetCoreConfigValue("MinidumpSymbolUrl");
-		if (!symbolUrl) symbolUrl = "http://crash.limetech.org/symbols/submit";
+		const char *symbolUrl = acceleratorConfig.GetValue("MinidumpSymbolUrl");
+		if (!symbolUrl) symbolUrl = "https://crash.limetech.org/symbols/submit";
 
-		bool symbolUploaded = xfer->PostAndDownload(symbolUrl, form, &data, NULL);
+		auto result = control.RunRequest([&]() {
+			return xfer->PostAndDownload(symbolUrl, form.get(), &data, NULL);
+		});
 
-		if (!symbolUploaded) {
-			if (log) fprintf(log, "Symbol upload failed: %s (%d)\n", xfer->LastErrorMessage(), xfer->LastErrorCode());
+		if (result != UploadRequestResult::Succeeded) {
+			if (log && result == UploadRequestResult::Failed) fprintf(log, "Symbol upload failed: %s (%d)\n", xfer->LastErrorMessage(), xfer->LastErrorCode());
 			if (log) fflush(log);
 			return false;
 		}
 
 		int responseSize = data.GetSize();
-		char *response = new char[responseSize + 1];
-		strncpy(response, data.GetBuffer(), responseSize + 1);
-		response[responseSize] = '\0';
+		char *response = data.GetBuffer();
 		while (responseSize > 0 && response[responseSize - 1] == '\n') {
 			response[--responseSize] = '\0';
 		}
 		if (log) fprintf(log, "Symbol upload complete: %s\n", response);
-		delete[] response;
 		if (log) fflush(log);
 		return true;
 	}
 #endif
 
 	bool UploadModuleFile(const google_breakpad::CodeModule *module, const char *presubmitToken) {
+		if (control.ShouldStop()) {
+			return false;
+		}
 		const auto &codeFile = module->code_file();
 
-#ifndef WIN32
+#if !defined _WINDOWS
 		if (codeFile[0] != '/') {
 #else
-		if (codeFile[1] != ':') {
+		if (codeFile.size() < 3 || codeFile[1] != ':') {
 #endif
 			return false;
 		}
@@ -657,9 +813,12 @@ class UploadThread: public IThread
 		if (log) fprintf(log, "Submitting binary for %s\n", codeFile.c_str());
 		if (log) fflush(log);
 
-		IWebForm *form = webternet->CreateForm();
+		std::unique_ptr<IWebForm> form(webternet->CreateForm());
+		if (!form) {
+			return false;
+		}
 
-		const char *minidumpAccount = g_pSM->GetCoreConfigValue("MinidumpAccount");
+		const char *minidumpAccount = acceleratorConfig.GetValue("MinidumpAccount");
 		if (minidumpAccount && minidumpAccount[0]) form->AddString("UserID", minidumpAccount);
 
 		form->AddString("ExtensionVersion", SMEXT_CONF_VERSION);
@@ -675,30 +834,32 @@ class UploadThread: public IThread
 		form->AddFile("code_file", codeFile.c_str());
 
 		MemoryDownloader data;
-		IWebTransfer *xfer = webternet->CreateSession();
+		std::unique_ptr<IWebTransfer> xfer(webternet->CreateSession());
+		if (!xfer) {
+			return false;
+		}
 		xfer->SetFailOnHTTPError(true);
 
-		const char *binaryUrl = g_pSM->GetCoreConfigValue("MinidumpBinaryUrl");
-		if (!binaryUrl) binaryUrl = "http://crash.limetech.org/binary/submit";
+		const char *binaryUrl = acceleratorConfig.GetValue("MinidumpBinaryUrl");
+		if (!binaryUrl) binaryUrl = "https://crash.limetech.org/binary/submit";
 
-		bool binaryUploaded = xfer->PostAndDownload(binaryUrl, form, &data, NULL);
+		auto result = control.RunRequest([&]() {
+			return xfer->PostAndDownload(binaryUrl, form.get(), &data, NULL);
+		});
 
-		if (!binaryUploaded) {
-			if (log) fprintf(log, "Binary upload failed: %s (%d)\n", xfer->LastErrorMessage(), xfer->LastErrorCode());
+		if (result != UploadRequestResult::Succeeded) {
+			if (log && result == UploadRequestResult::Failed) fprintf(log, "Binary upload failed: %s (%d)\n", xfer->LastErrorMessage(), xfer->LastErrorCode());
 			if (log) fflush(log);
 			return false;
 		}
 
 		int responseSize = data.GetSize();
-		char *response = new char[responseSize + 1];
-		strncpy(response, data.GetBuffer(), responseSize + 1);
-		response[responseSize] = '\0';
+		char *response = data.GetBuffer();
 		while (responseSize > 0 && response[responseSize - 1] == '\n') {
 			response[--responseSize] = '\0';
 		}
 		if (log) fprintf(log, "Binary upload complete: %s\n", response);
 		if (log) fflush(log);
-		delete[] response;
 
 		return true;
 	}
@@ -719,38 +880,19 @@ class UploadThread: public IThread
 		"Extension",
 	};
 
-#ifndef WIN32
+#if !defined _WINDOWS
 #define PATH_SEP "/"
 #else
 #define PATH_SEP "\\"
 #endif
 
 	bool PathPrefixMatches(const std::string &prefix, const std::string &path) {
-#ifndef WIN32
+#if !defined _WINDOWS
 		return strncmp(prefix.c_str(), path.c_str(), prefix.length()) == 0;
 #else
 		return _strnicmp(prefix.c_str(), path.c_str(), prefix.length()) == 0;
 #endif
 	}
-
-	struct PathComparator {
-		struct compare {
-			bool operator() (const unsigned char &a, const unsigned char &b) const {
-#ifndef WIN32
-				return a < b;
-#else
-				return tolower(a) < tolower(b);
-#endif
-			}
-		};
-
-		bool operator() (const std::string &a, const std::string &b) const {
-			return !std::lexicographical_compare(
-				a.begin(), a.end(),
-				b.begin(), b.end(),
-				compare());
-		};
-	};
 
 	std::map<std::string, ModuleType, PathComparator> modulePathMap;
 	bool InitModuleClassificationMap(const std::string &base) {
@@ -772,14 +914,14 @@ class UploadThread: public IThread
 
 		const auto &codeFile = module->code_file();
 
-#ifndef WIN32
+#if !defined _WINDOWS
 		if (codeFile == "linux-gate.so") {
 			return kMTSystem;
 		}
 
 		if (codeFile[0] != '/') {
 #else
-		if (codeFile[1] != ':') {
+		if (codeFile.size() < 3 || codeFile[1] != ':') {
 #endif
 			return kMTUnknown;
 		}
@@ -810,12 +952,16 @@ class UploadThread: public IThread
 	enum PresubmitResponse {
 		kPRLocalError,
 		kPRRemoteError,
+		kPRStopped,
 		kPRDontUpload,
 		kPRUploadCrashDumpAndMetadata,
 		kPRUploadMetadataOnly,
 	};
 
 	PresubmitResponse PresubmitCrashDump(const char *path, char *tokenBuffer, size_t tokenBufferLength) {
+		if (control.ShouldStop()) {
+			return kPRStopped;
+		}
 		google_breakpad::ProcessState processState;
 		google_breakpad::ProcessResult processResult;
 		google_breakpad::MinidumpProcessor minidumpProcessor(nullptr, nullptr);
@@ -844,6 +990,9 @@ class UploadThread: public IThread
 			requestingThread = 0;
 		}
 
+		if (requestingThread < 0 || static_cast<size_t>(requestingThread) >= processState.threads()->size()) {
+			return kPRLocalError;
+		}
 		const google_breakpad::CallStack *stack = processState.threads()->at(requestingThread);
 		if (!stack) {
 			return kPRLocalError;
@@ -886,9 +1035,12 @@ class UploadThread: public IThread
 		auto summaryLine = summaryStream.str();
 		// printf("%s\n", summaryLine.c_str());
 
-		IWebForm *form = webternet->CreateForm();
+		std::unique_ptr<IWebForm> form(webternet->CreateForm());
+		if (!form) {
+			return kPRLocalError;
+		}
 
-		const char *minidumpAccount = g_pSM->GetCoreConfigValue("MinidumpAccount");
+		const char *minidumpAccount = acceleratorConfig.GetValue("MinidumpAccount");
 		if (minidumpAccount && minidumpAccount[0]) form->AddString("UserID", minidumpAccount);
 
 		form->AddString("ExtensionVersion", SMEXT_CONF_VERSION);
@@ -897,23 +1049,29 @@ class UploadThread: public IThread
 		form->AddString("CrashSignature", summaryLine.c_str());
 
 		MemoryDownloader data;
-		IWebTransfer *xfer = webternet->CreateSession();
+		std::unique_ptr<IWebTransfer> xfer(webternet->CreateSession());
+		if (!xfer) {
+			return kPRLocalError;
+		}
 		xfer->SetFailOnHTTPError(true);
 
-		const char *minidumpUrl = g_pSM->GetCoreConfigValue("MinidumpUrl");
-		if (!minidumpUrl) minidumpUrl = "http://crash.limetech.org/submit";
+		const char *minidumpUrl = acceleratorConfig.GetValue("MinidumpUrl");
+		if (!minidumpUrl) minidumpUrl = "https://crash.limetech.org/submit";
 
-		bool uploaded = xfer->PostAndDownload(minidumpUrl, form, &data, NULL);
+		auto result = control.RunRequest([&]() {
+			return xfer->PostAndDownload(minidumpUrl, form.get(), &data, NULL);
+		});
 
-		if (!uploaded) {
+		if (result == UploadRequestResult::NotStarted) {
+			return kPRStopped;
+		}
+		if (result == UploadRequestResult::Failed) {
 			if (log) fprintf(log, "Presubmit failed: %s (%d)\n", xfer->LastErrorMessage(), xfer->LastErrorCode());
 			return kPRRemoteError;
 		}
 
 		int responseSize = data.GetSize();
-		char *response = new char[responseSize + 1];
-		strncpy(response, data.GetBuffer(), responseSize + 1);
-		response[responseSize] = '\0';
+		char *response = data.GetBuffer();
 		while (responseSize > 0 && response[responseSize - 1] == '\n') {
 			response[--responseSize] = '\0';
 		}
@@ -921,13 +1079,11 @@ class UploadThread: public IThread
 
 		if (responseSize < 2) {
 			if (log) fprintf(log, "Presubmit response too short\n");
-			delete[] response;
 			return kPRRemoteError;
 		}
 
 		if (response[0] == 'E') {
 			if (log) fprintf(log, "Presubmit error: %s\n", &response[2]);
-			delete[] response;
 			return kPRRemoteError;
 		}
 
@@ -939,15 +1095,18 @@ class UploadThread: public IThread
 
 		if (response[1] != '|') {
 			if (log) fprintf(log, "Response delimiter missing\n");
-			delete[] response;
 			return kPRRemoteError;
+		}
+
+		// A service-requested skip is complete; it needs no supporting uploads.
+		if (presubmitResponse == kPRDontUpload) {
+			return presubmitResponse;
 		}
 
 		unsigned int responseCount = responseSize - 2;
 		if (responseCount < moduleCount) {
 			if (log) fprintf(log, "Response module list doesn't match sent list (%d < %d)\n", responseCount, moduleCount);
-			delete[] response;
-			return presubmitResponse;
+			return kPRRemoteError;
 		}
 
 		// There was a presubmit token included.
@@ -969,6 +1128,9 @@ class UploadThread: public IThread
 
 		if (moduleCount > 0) {
 			auto mainModule = processState.modules()->GetMainModule();
+			if (!mainModule) {
+				return kPRLocalError;
+			}
 			auto executableBaseDir = PathnameStripper_Directory(mainModule->code_file());
 			InitModuleClassificationMap(executableBaseDir);
 
@@ -976,13 +1138,15 @@ class UploadThread: public IThread
 			// 1 = System Only
 			// 2 = System + Game
 			// 3 = System + Game + Addons
-			const char *symbolSubmitOptionStr = g_pSM->GetCoreConfigValue("MinidumpSymbolUpload");
+			const char *symbolSubmitOptionStr = acceleratorConfig.GetValue("MinidumpSymbolUpload");
 			int symbolSubmitOption = symbolSubmitOptionStr ? atoi(symbolSubmitOptionStr) : 3;
 
-			const char *binarySubmitOption = g_pSM->GetCoreConfigValue("MinidumpBinaryUpload");
-			bool canBinarySubmit = !binarySubmitOption || (tolower(binarySubmitOption[0]) == 'y' || binarySubmitOption[0] == '1');
+			bool canBinarySubmit = acceleratorConfig.GetBool("MinidumpBinaryUpload", true);
 
 			for (unsigned int moduleIndex = 0; moduleIndex < moduleCount; ++moduleIndex) {
+				if (control.ShouldStop()) {
+					return kPRStopped;
+				}
 				bool submitSymbols = false;
 				bool submitBinary = (response[2 + moduleIndex] == 'U');
 
@@ -1024,11 +1188,17 @@ class UploadThread: public IThread
 
 				if (canBinarySubmit && submitBinary) {
 					UploadModuleFile(module, tokenBuffer);
+					if (control.ShouldStop()) {
+						return kPRStopped;
+					}
 				}
 
 #if defined _LINUX
 				if (submitSymbols) {
 					UploadSymbolFile(module, tokenBuffer);
+					if (control.ShouldStop()) {
+						return kPRStopped;
+					}
 				}
 #endif
 			}
@@ -1036,14 +1206,19 @@ class UploadThread: public IThread
 		if (log) fprintf(log, "PresubmitCrashDump complete\n");
 		if (log) fflush(log);
 
-		delete[] response;
 		return presubmitResponse;
 	}
 
 	bool UploadCrashDump(const char *path, const char *metapath, const char *presubmitToken, char *response, int maxlen) {
-		IWebForm *form = webternet->CreateForm();
+		std::unique_ptr<IWebForm> form(webternet->CreateForm());
+		if (!form) {
+			if (response && maxlen > 0) {
+				g_pSM->Format(response, maxlen, "Failed to create upload form");
+			}
+			return false;
+		}
 
-		const char *minidumpAccount = g_pSM->GetCoreConfigValue("MinidumpAccount");
+		const char *minidumpAccount = acceleratorConfig.GetValue("MinidumpAccount");
 		if (minidumpAccount && minidumpAccount[0]) form->AddString("UserID", minidumpAccount);
 
 		form->AddString("GameDirectory", crashGameDirectory);
@@ -1063,15 +1238,24 @@ class UploadThread: public IThread
 		}
 
 		MemoryDownloader data;
-		IWebTransfer *xfer = webternet->CreateSession();
+		std::unique_ptr<IWebTransfer> xfer(webternet->CreateSession());
+		if (!xfer) {
+			if (response && maxlen > 0) {
+				g_pSM->Format(response, maxlen, "Failed to create upload session");
+			}
+			return false;
+		}
 		xfer->SetFailOnHTTPError(true);
 
-		const char *minidumpUrl = g_pSM->GetCoreConfigValue("MinidumpUrl");
-		if (!minidumpUrl) minidumpUrl = "http://crash.limetech.org/submit";
+		const char *minidumpUrl = acceleratorConfig.GetValue("MinidumpUrl");
+		if (!minidumpUrl) minidumpUrl = "https://crash.limetech.org/submit";
 
-		bool uploaded = xfer->PostAndDownload(minidumpUrl, form, &data, NULL);
+		auto result = control.RunRequest([&]() {
+			return xfer->PostAndDownload(minidumpUrl, form.get(), &data, NULL);
+		});
+		bool uploaded = result == UploadRequestResult::Succeeded;
 
-		if (response) {
+		if (response && maxlen > 0) {
 			if (uploaded) {
 				int responseSize = data.GetSize();
 				if (responseSize >= maxlen) responseSize = maxlen - 1;
@@ -1080,6 +1264,8 @@ class UploadThread: public IThread
 				while (responseSize > 0 && response[responseSize - 1] == '\n') {
 					response[--responseSize] = '\0';
 				}
+			} else if (result == UploadRequestResult::NotStarted) {
+				g_pSM->Format(response, maxlen, "Upload pass stopped before submission");
 			} else {
 				g_pSM->Format(response, maxlen, "%s (%d)", xfer->LastErrorMessage(), xfer->LastErrorCode());
 			}
@@ -1091,7 +1277,7 @@ class UploadThread: public IThread
 
 void Accelerator::NotifyIfDoneUploading()
 {
-	if (!IsMapStarted() || !IsDoneUploading()) {
+	if (!IsMapStarted() || !IsDoneUploading() || !extforwards::IsInitialized()) {
 		return;
 	}
 
@@ -1104,6 +1290,9 @@ class VFuncEmptyClass {};
 
 const char *GetCmdLine()
 {
+	if (!optionalGameHelpers) {
+		return "";
+	}
 	static int getCmdLineOffset = 0;
 	if (getCmdLineOffset == 0) {
 		if (!gameconfig || !gameconfig->GetOffset("GetCmdLine", &getCmdLineOffset)) {
@@ -1114,13 +1303,22 @@ const char *GetCmdLine()
 		}
 	}
 
-	void *cmdline = gamehelpers->GetValveCommandLine();
+	void *cmdline = optionalGameHelpers->GetValveCommandLine();
+	if (!cmdline) {
+		return "";
+	}
 	void **vtable = *(void ***)cmdline;
+	if (!vtable) {
+		return "";
+	}
 	void *vfunc = vtable[getCmdLineOffset];
+	if (!vfunc) {
+		return "";
+	}
 
 	union {
 		const char *(VFuncEmptyClass::*mfpnew)();
-#ifndef WIN32
+#if !defined _WINDOWS
 		struct {
 			void *addr;
 			intptr_t adjustor;
@@ -1134,7 +1332,8 @@ const char *GetCmdLine()
 	u.addr = vfunc;
 #endif
 
-	return (const char *)(reinterpret_cast<VFuncEmptyClass*>(cmdline)->*u.mfpnew)();
+	const char *line = (const char *)(reinterpret_cast<VFuncEmptyClass*>(cmdline)->*u.mfpnew)();
+	return line ? line : "";
 }
 
 Accelerator::Accelerator() :
@@ -1144,8 +1343,32 @@ Accelerator::Accelerator() :
 
 bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 {
-	sharesys->AddDependency(myself, "webternet.ext", true, true);
-	SM_GET_IFACE(WEBTERNET, webternet);
+	// Keep configuration immutable once the upload thread has started.
+	char configPath[512];
+	g_pSM->BuildPath(Path_SM, configPath, sizeof(configPath), "configs/accelerator.cfg");
+	acceleratorConfig = AcceleratorConfig();
+	if (libsys->PathExists(configPath)) {
+		if (!acceleratorConfig.Load(textparsers, configPath, error, maxlength)) {
+			return false;
+		}
+	} else {
+		smutils->LogMessage(myself, "WARNING: %s not found; using Accelerator defaults. Settings in core.cfg are no longer read.", configPath);
+	}
+
+	// Metadata must not prevent the native crash handler from being installed.
+	// Retry later if core interface registration is not yet complete.
+	AcquireGameHelpers();
+
+	if (!acceleratorConfig.GetBool("MinidumpDisableUpload", false)) {
+		for (const char *key : {"MinidumpUrl", "MinidumpSymbolUrl", "MinidumpBinaryUrl"}) {
+			const char *url = acceleratorConfig.GetValue(key);
+			if (url && strncasecmp(url, "http://", 7) == 0) {
+				smutils->LogMessage(myself, "WARNING: %s uses unencrypted HTTP. Update the endpoint to HTTPS to protect crash data.", key);
+			}
+		}
+		sharesys->AddDependency(myself, "webternet.ext", true, true);
+		SM_GET_IFACE(WEBTERNET, webternet);
+	}
 
 	g_pSM->BuildPath(Path_SM, dumpStoragePath, sizeof(dumpStoragePath), "data/dumps");
 
@@ -1165,8 +1388,6 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 	strncpy(crashGamePath, g_pSM->GetGamePath(), sizeof(crashGamePath) - 1);
 	strncpy(crashSourceModPath, g_pSM->GetSourceModPath(), sizeof(crashSourceModPath) - 1);
 	strncpy(crashGameDirectory, g_pSM->GetGameFolderName(), sizeof(crashGameDirectory) - 1);
-
-	threader->MakeThread(&uploadThread);
 
 	do {
 		char gameconfigError[256];
@@ -1213,21 +1434,37 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 	sigaction(SIGSEGV, NULL, &oact);
 	SignalHandler = oact.sa_sigaction;
 
-	g_pSM->AddGameFrameHook(OnGameFrame);
+	previousTerminateHandler = std::set_terminate(terminateHandler);
 #elif defined _WINDOWS
-	wchar_t *buf = new wchar_t[sizeof(dumpStoragePath)];
+	wchar_t buf[sizeof(dumpStoragePath)];
 	size_t num_chars = mbstowcs(buf, dumpStoragePath, sizeof(dumpStoragePath));
+	if (num_chars == static_cast<size_t>(-1) || num_chars >= sizeof(dumpStoragePath)) {
+		if (error && maxlength) {
+			g_pSM->Format(error, maxlength, "Cannot convert Accelerator dump directory to a Windows path");
+		}
+		return false;
+	}
 
 	handler = new google_breakpad::ExceptionHandler(
 		std::wstring(buf, num_chars), NULL, dumpCallback, NULL, google_breakpad::ExceptionHandler::HANDLER_ALL,
 		static_cast<MINIDUMP_TYPE>(MiniDumpWithUnloadedModules | MiniDumpWithFullMemoryInfo), static_cast<const wchar_t *>(NULL), NULL);
 
-	vectoredHandler = AddVectoredExceptionHandler(0, BreakpadVectoredHandler);
+	windowsFirstChance = acceleratorConfig.GetBool("MinidumpWindowsFirstChance", true);
+	windowsCaptureGate.Reset();
+	// First in the vectored chain at registration time, before existing engine
+	// handlers. Later third-party registrations can still change that ordering.
+	vectoredHandler = AddVectoredExceptionHandler(1, BreakpadVectoredHandler);
+	if (!vectoredHandler) {
+		smutils->LogError(myself, "Failed to register Accelerator's Windows vectored handler (error %lu); engine-intercepted crashes may not be captured.", GetLastError());
+	} else {
+		rootconsole->ConsolePrint("Accelerator Windows first-chance crash capture: %s", windowsFirstChance ? "enabled" : "disabled (fatal Sys_Error only)");
+	}
 
-	delete buf;
 #else
 #error Bad platform.
 #endif
+
+	g_pSM->AddGameFrameHook(OnGameFrame);
 
 #if SMINTERFACE_EXTENSIONAPI_VERSION < 9
 	// 1.13 links the SourcePawn VM into sourcemod.logic and dropped ISourcePawnFactory,
@@ -1295,49 +1532,19 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 
 		fclose(steamInfFile);
 
-		unsigned commentChars = 0;
-		unsigned valueChars = 0;
-		unsigned source = 0;
-		strcpy(steamInf, "\nSteam_");
-		unsigned target = 7; // strlen("\nSteam_");
-		while (true) {
-			if (steamInfTemp[source] == '\0') {
-				source++;
-				break;
-			}
-			if (steamInfTemp[source] == '/') {
-				source++;
-				commentChars++;
-				continue;
-			}
-			if (commentChars == 1) {
-				commentChars = 0;
-				steamInf[target++] = '/';
-				valueChars++;
-			}
-			if (steamInfTemp[source] == '\r') {
-				source++;
-				continue;
-			}
-			if (steamInfTemp[source] == '\n') {
-				commentChars = 0;
-				source++;
-				if (steamInfTemp[source] == '\0') {
-					break;
-				}
-				if (valueChars > 0) {
-					valueChars = 0;
-					strcpy(&steamInf[target], "\nSteam_");
-					target += 7;
-				}
-				continue;
-			}
-			if (commentChars >= 2) {
-				source++;
-				continue;
-			}
-			steamInf[target++] = steamInfTemp[source++];
-			valueChars++;
+		BuildSteamInf(steamInfTemp, steamInf, sizeof(steamInf));
+	}
+
+	// Start only after the handler and all crash metadata are initialized.
+	if (acceleratorConfig.GetBool("MinidumpDisableUpload", false)) {
+		rootconsole->ConsolePrint("Accelerator uploads are disabled; crash dumps will be kept locally.");
+		MarkAsDoneUploading();
+	} else {
+		uploadThread.Reset();
+		m_uploadThread = threader->MakeThread(&uploadThread, Thread_Default);
+		if (!m_uploadThread) {
+			smutils->LogError(myself, "Failed to start Accelerator upload thread; dumps remain on disk.");
+			MarkAsDoneUploading();
 		}
 	}
 
@@ -1350,24 +1557,49 @@ bool Accelerator::SDK_OnLoad(char *error, size_t maxlength, bool late)
 
 void Accelerator::SDK_OnUnload()
 {
+	uploadThread.RequestStop();
+	g_pSM->RemoveGameFrameHook(OnGameFrame);
+	// Do not release interfaces, forwards or extension code while the worker
+	// might still be using them. WaitForThread also waits for OnTerminate.
+	if (m_uploadThread) {
+		m_uploadThread->WaitForThread();
+		m_uploadThread->DestroyThis();
+		m_uploadThread = nullptr;
+	}
 	extforwards::Shutdown();
 	plsys->RemovePluginsListener(this);
 
 #if defined _LINUX
-	g_pSM->RemoveGameFrameHook(OnGameFrame);
+	if (std::get_terminate() == terminateHandler) {
+		std::set_terminate(previousTerminateHandler);
+	}
 #elif defined _WINDOWS
+	windowsCaptureGate.RequestStop();
 	if (vectoredHandler) {
 		RemoveVectoredExceptionHandler(vectoredHandler);
+		vectoredHandler = nullptr;
+	}
+	// Do not destroy Breakpad while a vectored callback is using it.
+	while (windowsCaptureGate.IsBusy()) {
+		Sleep(1);
 	}
 #else
 #error Bad platform.
 #endif
 
 	delete handler;
+	handler = nullptr;
+	optionalGameHelpers = nullptr;
 }
 
 void Accelerator::SDK_OnAllLoaded()
 {
+	if (!AcquireGameHelpers()) {
+		smutils->LogMessage(myself,
+			"WARNING: IGameHelpers interface version %u unavailable for Accelerator %s; crash capture remains active, but map and command-line metadata may be absent.",
+			static_cast<unsigned int>(SMINTERFACE_GAMEHELPERS_VERSION), SMEXT_CONF_VERSION);
+	}
+	strncpy(crashCommandLine, GetCmdLine(), sizeof(crashCommandLine) - 1);
 	extforwards::Init();
 	sharesys->RegisterLibrary(myself, "accelerator");
 
@@ -1375,16 +1607,19 @@ void Accelerator::SDK_OnAllLoaded()
 	m_natives.push_back({ nullptr, nullptr }); // SM requires this to signal the end of the native info array
 
 	sharesys->AddNatives(myself, m_natives.data());
-
-	NotifyIfDoneUploading();
 }
 
 void Accelerator::OnCoreMapStart(edict_t *pEdictList, int edictCount, int clientMax)
 {
-	strncpy(crashMap, gamehelpers->GetCurrentMap(), sizeof(crashMap) - 1);
+	crashMap[0] = '\0';
+	if (AcquireGameHelpers()) {
+		const char *map = optionalGameHelpers->GetCurrentMap();
+		if (map) {
+			strncpy(crashMap, map, sizeof(crashMap) - 1);
+		}
+	}
+	strncpy(crashCommandLine, GetCmdLine(), sizeof(crashCommandLine) - 1);
 	m_maphasstarted.store(true);
-
-	NotifyIfDoneUploading();
 }
 
 /* 010 Editor Template
@@ -1479,15 +1714,10 @@ void Accelerator::OnPluginLoaded(IPlugin *plugin)
 		return;
 	}
 
-#if SMINTERFACE_EXTENSIONAPI_VERSION >= 9
-	// 1.13 moved publics enumeration onto sp::BaseRuntime.
-	sp::BaseRuntime *publics = runtime->GetBaseRuntime();
+	AcceleratorPublicRuntime *publics = GetAcceleratorPublicRuntime(runtime);
 	if (!publics) {
 		return;
 	}
-#else
-	IPluginRuntime *publics = runtime;
-#endif
 
 	const char *filename = plugin->GetFilename();
 	size_t filenameSize = strlen(filename) + 1;

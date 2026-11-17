@@ -1,3 +1,5 @@
 /build
+/.build-deps
+__pycache__/
 /extension/version_auto.h
 .vscode

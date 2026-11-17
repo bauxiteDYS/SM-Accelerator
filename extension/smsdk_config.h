@@ -64,7 +64,9 @@
 //#define SMEXT_ENABLE_DBMANAGER
 #define SMEXT_ENABLE_GAMECONF
 //#define SMEXT_ENABLE_MEMUTILS
-#define SMEXT_ENABLE_GAMEHELPERS
+// Game helpers only supply optional metadata. Request them explicitly and
+// non-fatally in extension.cpp instead of making the SDK reject the extension.
+//#define SMEXT_ENABLE_GAMEHELPERS
 //#define SMEXT_ENABLE_TIMERSYS
 #define SMEXT_ENABLE_THREADER
 #define SMEXT_ENABLE_LIBSYS
@@ -72,7 +74,7 @@
 //#define SMEXT_ENABLE_ADTFACTORY
 #define SMEXT_ENABLE_PLUGINSYS
 //#define SMEXT_ENABLE_ADMINSYS
-//#define SMEXT_ENABLE_TEXTPARSERS
+#define SMEXT_ENABLE_TEXTPARSERS
 //#define SMEXT_ENABLE_USERMSGS
 //#define SMEXT_ENABLE_TRANSLATOR
 //#define SMEXT_ENABLE_NINVOKE

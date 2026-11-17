@@ -1,49 +1,15 @@
 #!/bin/bash
-set -euxo pipefail
-
-dockerimage="debian:11-slim"
-
-
-# we do this so that we can be agnostic about where we're invoked from
-# meaning you can exec this script anywhere and it should work the same
-thisiswhereiam=${BASH_SOURCE[0]}
-# this should be /whatever/directory/structure/Open-Fortress-Source
-script_folder=$( cd -- "$( dirname -- "${thisiswhereiam}" )" &> /dev/null && pwd )
-
-
-# this should be /whatever/directory/structure/[accelerator_root]/cicd
-build_dir="dockerbuild"
-
-pushd "${script_folder}" &> /dev/null || exit 99
-
-    # this is relative to our source dir/build
-    internalscript="_accelerator_docker_build_internal.sh"
-
-    # this should always be our accelerator root dir
-    pushd ../ &> /dev/null
-        dev_srcdir=$(pwd)
-        container_rootdir="accelerator"
-
-        # add -it flags automatically if in null tty
-        itflag=""
-        if [ -t 0 ] ; then
-            itflag="-it"
-        else
-            itflag=""
-        fi
-
-        podman run ${itflag}                            \
-        -v "${dev_srcdir}":/"${container_rootdir}"        \
-        -w /${container_rootdir}                        \
-        ${dockerimage}                                  \
-        bash ./${build_dir}/${internalscript} "$@"
-
-        ecodereal=$?
-        echo "real exit code ${ecodereal}"
-
-    popd &> /dev/null || exit
-
-popd &> /dev/null || exit
-
-exit ${ecodereal}
-
+set -euo pipefail
+echo "Legacy container wrapper: prefer build.py or Actions -> Build packages."
+source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
+engine=${CONTAINER_ENGINE:-}
+if [ -z "$engine" ]; then
+    if command -v docker >/dev/null; then engine=docker
+    elif command -v podman >/dev/null; then engine=podman
+    else echo "Install Docker or Podman, or use build.py directly." >&2; exit 1
+    fi
+fi
+"$engine" run --rm \
+    -v "${source_dir}:/accelerator" -w /accelerator \
+    ghcr.io/alliedmodders/build-containers/debian11-clang22:latest \
+    bash dockerbuild/_accelerator_docker_build_internal.sh "$@"

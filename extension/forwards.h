@@ -7,7 +7,9 @@ namespace extforwards
 	void Init();
 	// Shutdown the sourcepawn forwards.
 	void Shutdown();
-	// Calls the on done uploadind forward. (thread safe)
+	// Main-thread only. Ready after Init and until Shutdown.
+	bool IsInitialized();
+	// Calls the completion forward synchronously on the main thread.
 	void CallOnDoneUploadingForward();
 }
 

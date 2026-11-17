@@ -9,7 +9,8 @@
 
 
 /**
- * Called when Accelerator is done uploading crash dumps.
+ * Called when Accelerator finishes this extension load's selected upload batch.
+ * Older unprocessed dumps may remain on disk due to MinidumpUploadLimit.
  */
 forward void Accelerator_OnDoneUploadingCrashes();
 
@@ -23,7 +24,8 @@ native int Accelerator_GetUploadedCrashCount();
 /**
  * Returns if Accelerator is done uploading crashes.
  *
- * @return					True if no more crashes will be uploaded, false if there are still crashes pending upload.
+ * @return					True when this load's upload pass has finished (or uploads are disabled).
+ *							Does not mean every dump on disk has been uploaded.
  */
 native bool Accelerator_IsDoneUploadingCrashes();
 

@@ -1,56 +1,42 @@
-# vim: set ts=2 sw=2 tw=99 noet ft=python: 
+# vim: set ts=2 sw=2 tw=99 noet ft=python:
+import json
 import os
-import re
-import subprocess
-from ambuild.cache import Cache
-import ambuild.command as command
+import runpy
 
-#Quickly try to ascertain the current repository revision
-def GetVersion():
-	rev = command.RunDirectCommand(AMBuild, ['git', 'rev-list', '--count', 'HEAD']).stdoutText.strip()
-	cset = command.RunDirectCommand(AMBuild, ['git', 'log', '--pretty=format:%h', '-n', '1']).stdoutText.strip()
-
-	if not rev or not cset:
-		raise Exception('Could not determine repository version')
-
-	return (rev, cset)
-
-def PerformReversioning():
-	rev, cset = GetVersion()
-	cacheFile = os.path.join(AMBuild.outputFolder, '.ambuild', 'hgcache')
-	cache = Cache(cacheFile)
-	if os.path.isfile(cacheFile):
-		cache.LoadCache()
-		if cache.HasVariable('cset') and cache['cset'] == cset:
-			return False
-	cache.CacheVariable('cset', cset)
-
-	productFile = open(os.path.join(AMBuild.sourceFolder, 'product.version'), 'r')
-	productContents = productFile.read()
-	productFile.close()
-	m = re.match('(\d+)\.(\d+)\.(\d+)(.*)', productContents)
-	if m == None:
-		raise Exception('Could not detremine product version')
-	major, minor, release, tag = m.groups()
-
-	incFolder = os.path.join(AMBuild.sourceFolder, 'extension')
-	incFile = open(os.path.join(incFolder, 'version_auto.h'), 'w')
-	incFile.write("""
-#ifndef _AUTO_VERSION_INFORMATION_H_
-#define _AUTO_VERSION_INFORMATION_H_
-
-#define SM_BUILD_TAG	 	\"{0}\"
-#define SM_BUILD_UNIQUEID	\"{1}:{2}\" SM_BUILD_TAG
-#define SM_VERSION			\"{3}.{4}.{5}\"
-#define SM_FULL_VERSION		SM_VERSION SM_BUILD_TAG
-#define SM_FILE_VERSION		{6},{7},{8},0
-
-#endif /* _AUTO_VERSION_INFORMATION_H_ */
-
-""".format(tag, rev, cset, major, minor, release, major, minor, release))
-	incFile.close()
-	cache.WriteCache()
-
-PerformReversioning()
-
-
+builder.SetBuildFolder('/')
+script = os.path.join(builder.sourcePath, 'build_support.py')
+builder.AddConfigureFile(script)
+support = runpy.run_path(script)
+identity, inputs = support['source_identity'](builder.sourcePath)
+for path in inputs:
+  builder.AddConfigureFile(str(path))
+for path in support['git_config_inputs'](builder.sourcePath) + support['git_config_inputs'](Accelerator.sm_root):
+  builder.AddConfigureFile(str(path))
+sm_version = support['sourcemod_version'](Accelerator.sm_root)
+sm_revision = support['git_revision'](Accelerator.sm_root)
+if builder.options.sm_version != 'custom' and sm_version != builder.options.sm_version:
+  raise Exception('SourceMod source version does not match --sm-version')
+for relative in ['product.version', 'public/IExtensionSys.h']:
+  builder.AddConfigureFile(os.path.join(Accelerator.sm_root, relative))
+header = support['version_header'](
+  open(os.path.join(builder.sourcePath, 'product.version')).read(), identity,
+  sm_version, sm_revision)
+Accelerator.version_header = builder.AddOutputFile('generated/accelerator_build.h', header.encode())
+info = {
+  'source': identity,
+  'sourcemod': {
+    'version': sm_version,
+    'revision': sm_revision,
+    'custom': builder.options.sm_version == 'custom',
+    'dirty': bool(support['git_output'](Accelerator.sm_root, 'status', '--porcelain')) if sm_revision else None,
+    'sourcepawn_revision': support['git_revision'](os.path.join(Accelerator.sm_root, 'sourcepawn')),
+  },
+  'platform': Accelerator.targets[0].target.platform,
+  'architectures': sorted(Accelerator.target_archs),
+  'optimized': builder.options.opt == '1',
+  'symbols': builder.options.debug == '1',
+  'compilers': [str(cxx.version) for cxx in Accelerator.targets],
+  'dependencies': json.load(open(os.path.join(builder.sourcePath, 'dependencies.json'))),
+}
+Accelerator.build_info = builder.AddOutputFile(
+  'generated/build-info.json', (json.dumps(info, indent=2) + '\n').encode())

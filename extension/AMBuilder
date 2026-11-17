@@ -6,6 +6,7 @@ builder.SetBuildFolder('/')
 project = builder.LibraryProject('accelerator.ext')
 project.sources = [
   'extension.cpp',
+  'AcceleratorConfig.cpp',
   'MemoryDownloader.cpp',
   'forwards.cpp',
   'natives.cpp',
@@ -21,6 +22,8 @@ def AddSourceFilesFromDir(path, files):
 for cxx in Accelerator.targets:
   binary = Accelerator.ConfigureExtension(project, cxx, builder)
   compiler = binary.compiler
+  compiler.defines += ['SM_GENERATED_BUILD']
+  compiler.sourcedeps += [Accelerator.version_header]
   # Wait for breakpad to be patched
   compiler.sourcedeps += Accelerator.breakpad_patch
   # We depend on breakpad on config
@@ -28,12 +31,12 @@ for cxx in Accelerator.targets:
 
   compiler.defines += ['HAVE_CONFIG_H']
   compiler.cxxincludes += [
-    os.path.join(builder.sourcePath, 'third_party', 'breakpad', 'src'),
+    os.path.join(Accelerator.breakpad_root, 'src'),
     os.path.join(builder.buildPath, 'third_party', 'config', compiler.target.arch),
   ]
 
   if compiler.target.platform in ['linux']:
-    binary.sources += AddSourceFilesFromDir(os.path.join(builder.currentSourcePath, '..', 'third_party', 'breakpad', 'src', 'common'), [
+    binary.sources += AddSourceFilesFromDir(os.path.join(Accelerator.breakpad_root, 'src', 'common'), [
       'dwarf_cfi_to_module.cc',
       'dwarf_cu_to_module.cc',
       'dwarf_line_to_module.cc',

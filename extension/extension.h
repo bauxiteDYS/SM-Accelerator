@@ -29,6 +29,7 @@
 #include <atomic>
 #include <vector>
 #include <mutex>
+#include <string>
 #include "smsdk_ext.h"
 
 /**
@@ -115,7 +116,7 @@ public: // IPluginsListener
 	/**
 	 * @brief Signals the extension that uploading is done.
 	 */
-	void MarkAsDoneUploading() { m_doneuploading.store(true); NotifyIfDoneUploading(); }
+	void MarkAsDoneUploading() { m_doneuploading.store(true); }
 	/**
 	 * @brief Is Accelerator done uploading crashes.
 	 * @return Returns true if yes, false otherwise.
@@ -127,12 +128,13 @@ public: // IPluginsListener
 	 */
 	bool IsMapStarted() const { return m_maphasstarted.load(); }
 
-private:
 	/**
-	 * @brief Fires the done uploading forward once uploading has finished and a map has started.
+	 * @brief Main-thread only: fires the completion forward when ready.
 	 */
 	void NotifyIfDoneUploading();
 
+private:
+	IThreadHandle *m_uploadThread = nullptr;
 	std::vector<UploadedCrash> m_uploadedcrashes; // Vector of uploaded crashes
 	std::vector<sp_nativeinfo_t> m_natives; // Vector of SourcePawn natives
 	mutable std::mutex m_uploadedcrashes_mutex; // mutex for accessing the m_uploadedcrashes vector

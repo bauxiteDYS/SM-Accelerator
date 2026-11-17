@@ -29,7 +29,6 @@
  * Version: $Id$
  */
 
-#include <assert.h>
 #include <string.h>
 #include <stdlib.h>
 #include "MemoryDownloader.h"
@@ -51,19 +50,34 @@ DownloadWriteStatus MemoryDownloader::OnDownloadWrite(IWebTransfer *session,
 													  size_t size,
 													  size_t nmemb)
 {
-	size_t total = size * nmemb;
-
-	if (bufpos + total > bufsize)
-	{
-		size_t rem = (bufpos + total) - bufsize;
-		bufsize += rem + (rem / 2);
-		buffer = (char *)realloc(buffer, bufsize);
+	// Responses are protocol/status messages, not downloadable dump files.
+	const size_t maxResponse = 1024 * 1024;
+	if (size && nmemb > (maxResponse - bufpos) / size) {
+		return DownloadWrite_Error;
 	}
-
-	assert(bufpos + total <= bufsize);
-
-	memcpy(&buffer[bufpos], ptr, total);
+	size_t total = size * nmemb;
+	if (!total) {
+		return DownloadWrite_Okay;
+	}
+	if (!ptr) {
+		return DownloadWrite_Error;
+	}
+	size_t required = bufpos + total + 1;
+	if (required > bufsize) {
+		size_t newsize = required + required / 2;
+		if (newsize > maxResponse + 1) {
+			newsize = maxResponse + 1;
+		}
+		char *newbuffer = (char *)realloc(buffer, newsize);
+		if (!newbuffer) {
+			return DownloadWrite_Error;
+		}
+		buffer = newbuffer;
+		bufsize = newsize;
+	}
+	memcpy(buffer + bufpos, ptr, total);
 	bufpos += total;
+	buffer[bufpos] = '\0';
 
 	return DownloadWrite_Okay;
 }
@@ -71,15 +85,18 @@ DownloadWriteStatus MemoryDownloader::OnDownloadWrite(IWebTransfer *session,
 void MemoryDownloader::Reset()
 {
 	bufpos = 0;
+	if (buffer) {
+		buffer[0] = '\0';
+	}
 }
 
 char *MemoryDownloader::GetBuffer()
 {
-	return buffer;
+	static char empty[] = "";
+	return buffer ? buffer : empty;
 }
 
 size_t MemoryDownloader::GetSize()
 {
 	return bufpos;
 }
-

@@ -1,0 +1,33 @@
+name: Build packages
+on:
+  workflow_dispatch:
+    inputs:
+      platform:
+        description: Server operating system
+        type: choice
+        options: [both, windows, linux]
+        default: both
+      sourcemod:
+        description: SourceMod target (each gets its own binary)
+        type: choice
+        options: [all, '1.11', '1.12', '1.13']
+        default: all
+      architecture:
+        description: Server architecture
+        type: choice
+        options: [both, x86, x86_64]
+        default: both
+permissions:
+  contents: read
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: ${{ fromJSON(inputs.platform == 'both' && '["windows","linux"]' || format('["{0}"]', inputs.platform)) }}
+        sourcemod: ${{ fromJSON(inputs.sourcemod == 'all' && '["1.11","1.12","1.13"]' || format('["{0}"]', inputs.sourcemod)) }}
+    uses: ./.github/workflows/build-extension.yml
+    with:
+      platform: ${{ matrix.platform }}
+      sourcemod: ${{ matrix.sourcemod }}
+      architecture: ${{ inputs.architecture }}

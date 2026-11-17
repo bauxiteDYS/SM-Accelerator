@@ -4,6 +4,8 @@ import os
 # This is where the files will be output to
 # package is the default
 builder.SetBuildFolder('package')
+package_root = builder.AddFolder('.')
+builder.AddCopy(Accelerator.build_info, package_root)
 
 # Add any folders you need to this list
 folder_list = [
@@ -66,4 +68,5 @@ for task in Accelerator.extension:
     builder.AddCopy(task.binary, folder_map['addons/sourcemod/extensions'])
 
 CopyDirContent('gamedata', 'addons/sourcemod/gamedata')
+CopyFile('configs/accelerator.cfg', 'addons/sourcemod/configs')
 CopyFile('extension/accelerator.autoload', 'addons/sourcemod/extensions')
